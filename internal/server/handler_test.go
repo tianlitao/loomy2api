@@ -403,6 +403,92 @@ func TestResponsesEndpoint(t *testing.T) {
 	}
 }
 
+// TestResponsesStreamCutOffFailsUpstream 上游发半截工具参数后直接断开、且没有
+// finish_reason 时，必须发 response.failed，不能补 response.completed 让客户端
+// 拿着残缺 JSON 去执行（那会报 “EOF while parsing an object”）。
+func TestResponsesStreamCutOffFailsUpstream(t *testing.T) {
+	chunk := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{\"cmd\":\"git st"}}]},"finish_reason":null}]}`
+	fs := newFakeUpstream(t, sseHandler(chunk))
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"m","input":"hi","stream":true,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: response.failed") {
+		t.Errorf("断流应发 response.failed，实际:\n%s", body)
+	}
+	if strings.Contains(body, "event: response.completed") {
+		t.Errorf("断流不应发 response.completed:\n%s", body)
+	}
+	if strings.Contains(body, "response.function_call_arguments.done") {
+		t.Error("断流不应把半截参数标记为 done")
+	}
+}
+
+// TestResponsesStreamCompleteToolSucceeds 正常收口的工具调用仍要发 completed。
+func TestResponsesStreamCompleteToolSucceeds(t *testing.T) {
+	chunk := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`
+	fs := newFakeUpstream(t, sseHandler(chunk, "[DONE]"))
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses",
+		strings.NewReader(`{"model":"m","input":"hi","stream":true,"tools":[{"type":"function","name":"shell","parameters":{"type":"object"}}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: response.completed") {
+		t.Errorf("完整调用应发 response.completed，实际:\n%s", body)
+	}
+	if strings.Contains(body, "event: response.failed") {
+		t.Errorf("完整调用不应发 response.failed:\n%s", body)
+	}
+}
+
+// TestAnthropicStreamCutOffFailsUpstream Anthropic 侧断流同样必须发 error，
+// 不能补 message_stop 把半截 input_json 当完整工具参数。
+func TestAnthropicStreamCutOffFailsUpstream(t *testing.T) {
+	chunk := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"toolu_1","function":{"name":"shell","arguments":"{\"cmd\":\"git st"}}]},"finish_reason":null}]}`
+	fs := newFakeUpstream(t, sseHandler(chunk))
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"shell","input_schema":{"type":"object"}}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: error") {
+		t.Errorf("断流应发 error 事件，实际:\n%s", body)
+	}
+	if strings.Contains(body, "event: message_stop") {
+		t.Errorf("断流不应发 message_stop:\n%s", body)
+	}
+}
+
+// TestAnthropicStreamCompleteToolSucceeds 正常工具调用仍发 message_stop。
+func TestAnthropicStreamCompleteToolSucceeds(t *testing.T) {
+	chunk := `{"id":"c1","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"toolu_1","function":{"name":"shell","arguments":"{\"cmd\":\"pwd\"}"}}]},"finish_reason":"tool_calls"}]}`
+	fs := newFakeUpstream(t, sseHandler(chunk, "[DONE]"))
+	h, _, _ := newTestHandler(t, fs.srv.URL, nil)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/messages",
+		strings.NewReader(`{"model":"m","max_tokens":64,"stream":true,"messages":[{"role":"user","content":"hi"}],"tools":[{"name":"shell","input_schema":{"type":"object"}}]}`))
+	w := httptest.NewRecorder()
+	h.Routes().ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: message_stop") {
+		t.Errorf("完整调用应发 message_stop，实际:\n%s", body)
+	}
+	if strings.Contains(body, "event: error") {
+		t.Errorf("完整调用不应发 error:\n%s", body)
+	}
+}
+
 // TestHealthz 无账号时 503、有账号时 200 且带 service 标识。
 func TestHealthz(t *testing.T) {
 	fs := newFakeUpstream(t, jsonHandler(200, `{}`))

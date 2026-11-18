@@ -800,14 +800,46 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		emit(ev)
 	}
 	sc := newSSEStream(resp.Body)
+	var readErr error
+	finished := false
 	for {
 		obj, ok, err := sc.Next()
-		if err != nil || !ok {
+		if err != nil {
+			readErr = err
+			break
+		}
+		if !ok {
 			break
 		}
 		for _, ev := range st.Feed(obj) {
 			emit(ev)
 		}
+		if choices, _ := obj["choices"].([]any); len(choices) > 0 {
+			if ch, ok := choices[0].(map[string]any); ok && str(ch["finish_reason"]) != "" {
+				finished = true
+			}
+		}
+	}
+	// 上游在收口前断流：绝不能补一个 response.completed 把半截参数当成完整调用
+	// 发出去。Codex 收到不完整 JSON 只会报 “EOF while parsing an object”。
+	if readErr != nil || !finished || st.Truncated() {
+		msg := "上游流在收口前中断，工具参数可能不完整"
+		if readErr != nil {
+			msg = "上游流读取失败: " + readErr.Error()
+		}
+		for _, ev := range st.Failure("upstream_stream_interrupted", msg) {
+			emit(ev)
+		}
+		h.Pool.ReportFailure(acc, http.StatusBadGateway, msg, skey, model)
+		h.record(usage.Record{
+			Account: acc.Name, Model: model, Kind: "responses", Stream: true, Status: 502,
+			LatencyMs: time.Since(started).Milliseconds(),
+			ClientIP:  clientIP(r), UserAgent: ua(r),
+			ToolsDeclared: declTools(chatReq), ToolCalls: st.ToolCalls(),
+			Error: msg,
+		})
+		h.logCall(acc, model, 502, time.Since(started), msg)
+		return
 	}
 	for _, ev := range st.Finish() {
 		emit(ev)
@@ -820,6 +852,7 @@ func (h *Handler) responsesStream(w http.ResponseWriter, r *http.Request, chatRe
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: time.Since(started).Milliseconds(),
 		ClientIP:  clientIP(r), UserAgent: ua(r),
+		ToolsDeclared: declTools(chatReq), ToolCalls: st.ToolCalls(),
 	})
 	h.logStream(acc, model, time.Since(started), 0, completion, reasoning, pts)
 }
@@ -946,14 +979,48 @@ func (h *Handler) anthropicStream(w http.ResponseWriter, r *http.Request, chatRe
 		emit(ev)
 	}
 	sc := newSSEStream(resp.Body)
+	var readErr error
+	finished := false
 	for {
 		obj, ok, err := sc.Next()
-		if err != nil || !ok {
+		if err != nil {
+			readErr = err
+			break
+		}
+		if !ok {
 			break
 		}
 		for _, ev := range st.Feed(obj) {
 			emit(ev)
 		}
+		if choices, _ := obj["choices"].([]any); len(choices) > 0 {
+			if ch, ok := choices[0].(map[string]any); ok && str(ch["finish_reason"]) != "" {
+				finished = true
+			}
+		}
+	}
+	if readErr != nil || !finished || st.Truncated() {
+		msg := "上游流在收口前中断，工具参数可能不完整"
+		if readErr != nil {
+			msg = "上游流读取失败: " + readErr.Error()
+		}
+		code := "upstream_stream_interrupted"
+		if readErr != nil {
+			code = "upstream_stream_error"
+		}
+		emit(bridge.Event{Name: "error", Data: map[string]any{
+			"type":  "error",
+			"error": map[string]any{"type": "api_error", "message": msg},
+		}})
+		h.Pool.ReportFailure(acc, http.StatusBadGateway, msg, skey, model)
+		h.record(usage.Record{
+			Account: acc.Name, Model: model, Kind: "messages", Stream: true, Status: 502,
+			LatencyMs: time.Since(started).Milliseconds(),
+			ClientIP:  clientIP(r), UserAgent: ua(r),
+			ToolsDeclared: declTools(chatReq), ToolCalls: st.ToolCalls(),
+			Error: code + ": " + msg,
+		})
+		return
 	}
 	for _, ev := range st.Finish() {
 		emit(ev)
@@ -966,6 +1033,7 @@ func (h *Handler) anthropicStream(w http.ResponseWriter, r *http.Request, chatRe
 		Prompt: prompt, Completion: completion, Reasoning: reasoning, Points: pts,
 		LatencyMs: time.Since(started).Milliseconds(),
 		ClientIP:  clientIP(r), UserAgent: ua(r),
+		ToolsDeclared: declTools(chatReq), ToolCalls: st.ToolCalls(),
 	})
 }
 

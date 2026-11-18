@@ -200,7 +200,8 @@ func ToAnthropic(obj map[string]any, model string) map[string]any {
 	content := []any{}
 	if r := str(message["reasoning_content"]); r != "" {
 		content = append(content, map[string]any{
-			"type": "thinking", "thinking": r, "signature": "",
+			"type": "thinking", "thinking": r,
+			"signature": "loomy_" + account.RandomHex(16),
 		})
 	}
 	if t := str(message["content"]); t != "" {
@@ -285,6 +286,11 @@ type StreamTranslator struct {
 	tools     map[int]*toolAccum
 	toolOrder []int
 	toolsSent bool
+
+	// 每个工具块一旦开口，就固定在某个 blockIdx 上，后续增量沿用同一 index，
+	// 避免并行调用时把参数写到别的块里。
+	toolIdx    map[int]int
+	toolOpened map[int]bool
 }
 
 type toolAccum struct {
@@ -299,10 +305,12 @@ func NewStreamTranslator(model, messageID string) *StreamTranslator {
 		messageID = "msg_" + account.RandomHex(12)
 	}
 	return &StreamTranslator{
-		Model:     model,
-		MessageID: messageID,
-		usage:     map[string]any{},
-		tools:     map[int]*toolAccum{},
+		Model:      model,
+		MessageID:  messageID,
+		usage:      map[string]any{},
+		tools:      map[int]*toolAccum{},
+		toolIdx:    map[int]int{},
+		toolOpened: map[int]bool{},
 	}
 }
 
@@ -329,6 +337,37 @@ func (s *StreamTranslator) Start() []Event {
 	}}}
 }
 
+// openBlock 切换到新内容块并返回它的 index。
+// Anthropic 要求块严格串行：文本/思考块未收口时，先由调用方发 content_block_stop。
+func (s *StreamTranslator) openBlock() int {
+	idx := s.blockIdx
+	s.blockIdx++
+	return idx
+}
+
+// closeThinking 收口 thinking 块并补 signature。
+//
+// Claude 客户端在下一轮会把 thinking 块原样回传；缺 signature 的块会被判为
+// 不可信而丢弃思考上下文。上游没有真签名，这里给网关私有占位串，客户端只把它
+// 当不透明凭据。
+func (s *StreamTranslator) closeThinking(out []Event) []Event {
+	if !s.thinkOpen {
+		return out
+	}
+	s.thinkOpen = false
+	out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
+		"type": "content_block_delta", "index": s.blockIdx,
+		"delta": map[string]any{
+			"type": "signature_delta", "signature": "loomy_" + account.RandomHex(16),
+		},
+	}})
+	out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
+		"type": "content_block_stop", "index": s.blockIdx,
+	}})
+	s.blockIdx++
+	return out
+}
+
 // Feed 处理一个 OpenAI SSE 增量对象，返回要发出的事件。
 func (s *StreamTranslator) Feed(obj map[string]any) []Event {
 	var out []Event
@@ -352,7 +391,7 @@ func (s *StreamTranslator) Feed(obj map[string]any) []Event {
 			s.thinkOpen = true
 			out = append(out, Event{Name: "content_block_start", Data: map[string]any{
 				"type": "content_block_start", "index": s.blockIdx,
-				"content_block": map[string]any{"type": "thinking", "thinking": ""},
+				"content_block": map[string]any{"type": "thinking", "thinking": "", "signature": ""},
 			}})
 		}
 		out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
@@ -362,13 +401,7 @@ func (s *StreamTranslator) Feed(obj map[string]any) []Event {
 	}
 
 	if text := str(delta["content"]); text != "" {
-		if s.thinkOpen {
-			s.thinkOpen = false
-			out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
-				"type": "content_block_stop", "index": s.blockIdx,
-			}})
-			s.blockIdx++
-		}
+		out = s.closeThinking(out)
 		if !s.textOpen {
 			s.textOpen = true
 			out = append(out, Event{Name: "content_block_start", Data: map[string]any{
@@ -402,8 +435,45 @@ func (s *StreamTranslator) Feed(obj map[string]any) []Event {
 			if name := str(fn["name"]); name != "" {
 				acc.Name = name
 			}
-			if args := str(fn["arguments"]); args != "" {
-				acc.Args.WriteString(args)
+			args := str(fn["arguments"])
+
+			// name 到齐就立刻开块；开块时要先补发此前缓存的参数（从 text/thinking
+			// 块切过来，避免块交错），之后每帧只发本帧增量，保证参数不重不漏。
+			if acc.Name != "" && !s.toolOpened[idx] {
+				out = s.closeThinking(out)
+				if s.textOpen {
+					s.textOpen = false
+					out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
+						"type": "content_block_stop", "index": s.blockIdx,
+					}})
+					s.blockIdx++
+				}
+				s.toolOpened[idx] = true
+				s.toolIdx[idx] = s.openBlock()
+				id := acc.ID
+				if id == "" {
+					id = "call_" + account.RandomHex(6)
+					acc.ID = id
+				}
+				out = append(out, Event{Name: "content_block_start", Data: map[string]any{
+					"type": "content_block_start", "index": s.toolIdx[idx],
+					"content_block": map[string]any{
+						"type": "tool_use", "id": id, "name": acc.Name, "input": map[string]any{},
+					},
+				}})
+				if buffered := acc.Args.String(); buffered != "" {
+					out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
+						"type": "content_block_delta", "index": s.toolIdx[idx],
+						"delta": map[string]any{"type": "input_json_delta", "partial_json": buffered},
+					}})
+				}
+			}
+			acc.Args.WriteString(args)
+			if s.toolOpened[idx] && args != "" {
+				out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
+					"type": "content_block_delta", "index": s.toolIdx[idx],
+					"delta": map[string]any{"type": "input_json_delta", "partial_json": args},
+				}})
 			}
 		}
 	}
@@ -414,17 +484,28 @@ func (s *StreamTranslator) Feed(obj map[string]any) []Event {
 	return out
 }
 
+// Truncated 报告上游是否在收口前断流，或工具参数是否仍是半截 JSON。
+// 与 Responses 侧同一契约：断流不能被当成正常 message_stop 转发。
+func (s *StreamTranslator) Truncated() bool {
+	if s.finishReason != "" || len(s.tools) == 0 {
+		return false
+	}
+	for _, acc := range s.tools {
+		if acc == nil {
+			continue
+		}
+		if acc.Name == "" || !json.Valid([]byte(acc.Args.String())) {
+			return true
+		}
+	}
+	return false
+}
+
 // Finish 收尾：把累积的工具调用整块发出，再发 message_delta + message_stop。
 func (s *StreamTranslator) Finish() []Event {
 	var out []Event
 
-	if s.thinkOpen {
-		s.thinkOpen = false
-		out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
-			"type": "content_block_stop", "index": s.blockIdx,
-		}})
-		s.blockIdx++
-	}
+	out = s.closeThinking(out)
 	if s.textOpen {
 		s.textOpen = false
 		out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
@@ -438,31 +519,39 @@ func (s *StreamTranslator) Finish() []Event {
 		if acc == nil || acc.Name == "" {
 			continue
 		}
-		id := acc.ID
-		if id == "" {
-			id = "call_" + account.RandomHex(6)
+		if !s.toolOpened[idx] {
+			// name 在收尾前才到：补开块并一次性发全量参数。
+			s.toolOpened[idx] = true
+			s.toolIdx[idx] = s.openBlock()
+			id := acc.ID
+			if id == "" {
+				id = "call_" + account.RandomHex(6)
+				acc.ID = id
+			}
+			out = append(out, Event{Name: "content_block_start", Data: map[string]any{
+				"type": "content_block_start", "index": s.toolIdx[idx],
+				"content_block": map[string]any{
+					"type": "tool_use", "id": id, "name": acc.Name, "input": map[string]any{},
+				},
+			}})
+			partial := acc.Args.String()
+			if partial == "" {
+				partial = "{}"
+			}
+			out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
+				"type": "content_block_delta", "index": s.toolIdx[idx],
+				"delta": map[string]any{"type": "input_json_delta", "partial_json": partial},
+			}})
 		}
-		out = append(out, Event{Name: "content_block_start", Data: map[string]any{
-			"type": "content_block_start", "index": s.blockIdx,
-			"content_block": map[string]any{
-				"type": "tool_use", "id": id, "name": acc.Name, "input": map[string]any{},
-			},
-		}})
-		partial := acc.Args.String()
-		if partial == "" {
-			partial = "{}"
-		}
-		out = append(out, Event{Name: "content_block_delta", Data: map[string]any{
-			"type": "content_block_delta", "index": s.blockIdx,
-			"delta": map[string]any{"type": "input_json_delta", "partial_json": partial},
-		}})
 		out = append(out, Event{Name: "content_block_stop", Data: map[string]any{
-			"type": "content_block_stop", "index": s.blockIdx,
+			"type": "content_block_stop", "index": s.toolIdx[idx],
 		}})
-		s.blockIdx++
 	}
 
-	usage := map[string]any{"output_tokens": intOf(s.usage["completion_tokens"])}
+	usage := map[string]any{
+		"input_tokens":  intOf(s.usage["prompt_tokens"]),
+		"output_tokens": intOf(s.usage["completion_tokens"]),
+	}
 	if v, ok := s.usage["points_consumed"]; ok {
 		usage["points_consumed"] = v
 	}
@@ -479,6 +568,17 @@ func (s *StreamTranslator) Finish() []Event {
 
 // Usage 返回累积到的 usage（供记账）。
 func (s *StreamTranslator) Usage() map[string]any { return s.usage }
+
+// ToolCalls 本轮实际开了几个 tool_use 块（供请求台账统计）。
+func (s *StreamTranslator) ToolCalls() int {
+	n := 0
+	for _, opened := range s.toolOpened {
+		if opened {
+			n++
+		}
+	}
+	return n
+}
 
 // ---------------------------------------------------------------- helpers
 
